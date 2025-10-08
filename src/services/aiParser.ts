@@ -1,17 +1,22 @@
-import OpenAI from 'openai';
-import { Student, ParsedStudentData } from '../types/Student';
-import { generatePassword, generateUniqueId } from '../utils/passwordGenerator';
-import { generateUsername } from '../utils/usernameGenerator';
+import {
+  BedrockRuntimeClient,
+  InvokeModelCommand,
+} from "@aws-sdk/client-bedrock-runtime";
+import { Student, ParsedStudentData } from "../types/Student";
+import { generatePassword, generateUniqueId } from "../utils/passwordGenerator";
+import { generateUsername } from "../utils/usernameGenerator";
 
-// Initialize OpenAI client with GitHub Models API
-const githubToken = process.env.REACT_APP_GITHUB_TOKEN;
-console.log('🔑 GitHub token loaded:', githubToken ? `${githubToken.substring(0, 8)}...` : 'MISSING');
-
-const openai = new OpenAI({
-  apiKey: githubToken || 'demo-key',
-  baseURL: 'https://models.github.ai/inference',
-  dangerouslyAllowBrowser: true // Only for demo purposes
+// Initialize AWS Bedrock client
+const bedrockClient = new BedrockRuntimeClient({
+  region: process.env.AWS_REGION || "us-east-1",
+  credentials: {
+    accessKeyId: process.env.REACT_APP_AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.REACT_APP_AWS_SECRET_ACCESS_KEY!,
+    sessionToken: process.env.REACT_APP_AWS_SESSION_TOKEN!,
+  },
 });
+
+const bedrockInferenceProfileId = process.env.REACT_APP_BEDROCK_INFERENCE_PROFILE_ID!;
 
 interface AIParsingResponse {
   students: Array<{
@@ -20,42 +25,45 @@ interface AIParsingResponse {
     confidence?: number;
   }>;
   errors?: string[];
-  contentType?: 'student_list' | 'mixed_content' | 'unlikely_student_content';
+  contentType?: "student_list" | "mixed_content" | "unlikely_student_content";
   confidence?: number;
   warnings?: string[];
 }
 
 // Validation helper function
-const validateExtractedData = (aiResponse: AIParsingResponse): { needsValidation: boolean } => {
+const validateExtractedData = (
+  aiResponse: AIParsingResponse
+): { needsValidation: boolean } => {
   const { students, contentType, confidence } = aiResponse;
-  
+
   // Check if validation is needed based on multiple factors
-  const needsValidation = 
-    contentType === 'unlikely_student_content' ||
-    contentType === 'mixed_content' ||
+  const needsValidation =
+    contentType === "unlikely_student_content" ||
+    contentType === "mixed_content" ||
     (confidence && confidence < 0.7) ||
     students.length === 0 ||
-    students.some(student => (student.confidence || 0) < 0.6) ||
+    students.some((student) => (student.confidence || 0) < 0.6) ||
     students.length > 50; // Suspiciously high number might indicate bad parsing
-    
+
   return { needsValidation };
 };
 
-export const parseStudentDataWithAI = async (input: string): Promise<ParsedStudentData> => {
+export const parseStudentDataWithAI = async (
+  input: string
+): Promise<ParsedStudentData> => {
   // Truncate input if it's too large for API (GitHub Models has token limits)
   const maxLength = 8000; // Conservative limit to avoid 413 errors
-  const truncatedInput = input.length > maxLength 
-    ? input.substring(0, maxLength) + '\n\n[Content truncated due to length...]'
-    : input;
-    
+  const truncatedInput =
+    input.length > maxLength
+      ? input.substring(0, maxLength) +
+        "\n\n[Content truncated due to length...]"
+      : input;
+
   // Debug logging
-  console.log('🔍 AI Parser Debug Info:');
-  console.log('- Token loaded:', process.env.REACT_APP_GITHUB_TOKEN ? 'YES' : 'NO');
-  console.log('- Token preview:', process.env.REACT_APP_GITHUB_TOKEN?.substring(0, 10) + '...');
-  console.log('- Base URL:', openai.baseURL);
-  console.log('- Input length:', input.length, 'characters');
-  console.log('- Truncated:', input.length > maxLength);
-  console.log('- Processing length:', truncatedInput.length, 'characters');
+  console.log("🔍 AI Parser Debug Info:");
+  console.log("- Input length:", input.length, "characters");
+  console.log("- Truncated:", input.length > maxLength);
+  console.log("- Processing length:", truncatedInput.length, "characters");
 
   try {
     const prompt = `
@@ -68,7 +76,7 @@ FIRST, analyze if this content likely contains student names:
 
 THEN, if names are found, validate each one:
 - Real names (John, Maria, Chen) = high confidence (0.8-1.0)
-- Questionable but possible names = medium confidence (0.4-0.7)  
+- Questionable but possible names = medium confidence (0.4-0.7)
 - Gibberish, random words, technical terms = low confidence (0.0-0.3)
 
 Input text:
@@ -97,29 +105,23 @@ STRICT VALIDATION RULES:
 - Provide specific warnings about questionable content
 `;
 
-    console.log('🚀 Making API request to GitHub Models...');
-    
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: "You are a helpful assistant that extracts student names from text. Always respond with valid JSON only."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
-      ],
-      temperature: 0.1,
-      max_tokens: 1000
+    console.log("🚀 Making API request to AWS Bedrock...");
+    const command = new InvokeModelCommand({
+      modelId: bedrockInferenceProfileId,
+      body: prompt,
+      contentType: "application/json",
+      accept: "application/json",
     });
 
-    console.log('✅ AI Response received:', response);
+    const response = await bedrockClient.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
 
-    const content = response.choices[0]?.message?.content;
+    console.log("✅ Bedrock Response received:", responseBody);
+
+    const content =
+      responseBody.choices?.[0]?.message?.content || responseBody.content;
     if (!content) {
-      throw new Error('No response from AI service');
+      throw new Error("No response from Bedrock service");
     }
 
     // Parse the JSON response
@@ -127,17 +129,17 @@ STRICT VALIDATION RULES:
     try {
       aiResponse = JSON.parse(content);
     } catch (parseError) {
-      console.error('Failed to parse AI response:', content);
-      throw new Error('Invalid AI response format');
+      console.error("Failed to parse AI response:", content);
+      throw new Error("Invalid AI response format");
     }
 
     // Validate the AI response and add quality checks
     const validationResult = validateExtractedData(aiResponse);
-    
+
     // Convert AI response to our format, filtering out low-confidence names
     const students: Student[] = aiResponse.students
-      .filter(student => (student.confidence || 0.5) >= 0.4) // Only include medium+ confidence
-      .map(student => {
+      .filter((student) => (student.confidence || 0.5) >= 0.4) // Only include medium+ confidence
+      .map((student) => {
         const firstName = student.firstName.trim();
         const lastInitial = student.lastName.trim().charAt(0).toUpperCase();
         return {
@@ -145,7 +147,7 @@ STRICT VALIDATION RULES:
           firstName,
           lastInitial,
           password: generatePassword(),
-          username: generateUsername(firstName, lastInitial)
+          username: generateUsername(firstName, lastInitial),
         };
       });
 
@@ -155,42 +157,47 @@ STRICT VALIDATION RULES:
       warnings: aiResponse.warnings || [],
       contentType: aiResponse.contentType,
       confidence: aiResponse.confidence,
-      needsValidation: validationResult.needsValidation
+      needsValidation: validationResult.needsValidation,
     };
-
   } catch (error) {
-    console.error('❌ AI parsing error details:', {
-      message: error instanceof Error ? error.message : 'Unknown error',
+    console.error("❌ AI parsing error details:", {
+      message: error instanceof Error ? error.message : "Unknown error",
       status: (error as any)?.status,
       statusText: (error as any)?.statusText,
       response: (error as any)?.response?.data,
-      stack: error instanceof Error ? error.stack : undefined
+      stack: error instanceof Error ? error.stack : undefined,
     });
-    
+
     // Check if it's a 413 error (request too large) and provide specific message
     if ((error as any)?.status === 413) {
       return {
         students: [],
-        errors: ['File content is too large for AI processing. Please try a smaller file or one with less content.'],
-        warnings: ['Large files may contain too much text for accurate name extraction.'],
-        contentType: 'unlikely_student_content',
+        errors: [
+          "File content is too large for AI processing. Please try a smaller file or one with less content.",
+        ],
+        warnings: [
+          "Large files may contain too much text for accurate name extraction.",
+        ],
+        contentType: "unlikely_student_content",
         confidence: 0,
-        needsValidation: true
+        needsValidation: true,
       };
     }
-    
+
     // For other API errors, provide more helpful messages
     if ((error as any)?.status >= 400 && (error as any)?.status < 500) {
       return {
         students: [],
-        errors: ['Unable to process with AI. Please check your file format and try again.'],
-        warnings: ['AI processing is temporarily unavailable.'],
-        contentType: 'unlikely_student_content',
+        errors: [
+          "Unable to process with AI. Please check your file format and try again.",
+        ],
+        warnings: ["AI processing is temporarily unavailable."],
+        contentType: "unlikely_student_content",
         confidence: 0,
-        needsValidation: true
+        needsValidation: true,
       };
     }
-    
+
     // Fallback to basic parsing if AI fails
     return fallbackParsing(input);
   }
@@ -198,16 +205,16 @@ STRICT VALIDATION RULES:
 
 // Fallback parsing function (your original logic as backup)
 const fallbackParsing = (text: string): ParsedStudentData => {
-  const lines = text.split('\n').filter(line => line.trim());
+  const lines = text.split("\n").filter((line) => line.trim());
   const students: Student[] = [];
-  const errors: string[] = ['AI parsing unavailable, using basic parsing'];
+  const errors: string[] = ["AI parsing unavailable, using basic parsing"];
 
   lines.forEach((line, index) => {
     const trimmedLine = line.trim();
     if (!trimmedLine) return;
 
-    let firstName = '';
-    let lastName = '';
+    let firstName = "";
+    let lastName = "";
 
     // Pattern 1: "First Last"
     const nameMatch = trimmedLine.match(/^([A-Za-z]+)\s+([A-Za-z]+)$/);
@@ -225,7 +232,7 @@ const fallbackParsing = (text: string): ParsedStudentData => {
         const singleNameMatch = trimmedLine.match(/^([A-Za-z]+)$/);
         if (singleNameMatch) {
           firstName = singleNameMatch[1];
-          lastName = '';
+          lastName = "";
         } else {
           errors.push(`Line ${index + 1}: Could not parse "${trimmedLine}"`);
           return;
@@ -234,14 +241,15 @@ const fallbackParsing = (text: string): ParsedStudentData => {
     }
 
     if (firstName) {
-      const formattedFirstName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
+      const formattedFirstName =
+        firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
       const formattedLastInitial = lastName.charAt(0).toUpperCase();
       students.push({
         id: generateUniqueId(),
         firstName: formattedFirstName,
         lastInitial: formattedLastInitial,
         password: generatePassword(),
-        username: generateUsername(formattedFirstName, formattedLastInitial)
+        username: generateUsername(formattedFirstName, formattedLastInitial),
       });
     }
   });
